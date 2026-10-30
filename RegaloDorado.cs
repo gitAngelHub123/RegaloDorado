@@ -7,7 +7,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppReloaded.Data;
 using Il2CppReloaded.DataModels;
@@ -16,7 +18,7 @@ using Il2CppReloaded.Services;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(RegaloDorado.RegaloDoradoMod), "Regalo Dorado", "1.2.0", "Angel")]
+[assembly: MelonInfo(typeof(RegaloDorado.RegaloDoradoMod), "Regalo Dorado", "1.2.1", "Angel")]
 [assembly: MelonGame("PopCap Games", "PvZ Replanted")]
 
 namespace RegaloDorado;
@@ -215,8 +217,9 @@ internal static class Textos
         get
         {
             string locale = "";
-            try { locale = Il2CppTekly.Localizations.Localizer.Instance?.Localize("$LOCALE") ?? ""; }
-            catch (Exception) { }
+            try { locale = LeerLocale(); }
+            catch (Exception e) { Diagnostico("excepción: " + e); }
+            Diagnostico("locale = '" + locale + "'");
 
             if (locale.StartsWith("Spanish")) return Espanol;
             if (locale.StartsWith("Portuguese")) return Portugues;
@@ -224,6 +227,68 @@ internal static class Textos
             if (locale.StartsWith("German")) return Aleman;
             return Ingles;
         }
+    }
+
+    // El tipo Localizer no se puede usar desde C#: Il2CppInterop no genera la interfaz ILocalizer,
+    // así que su clase base Singleton<Localizer, ILocalizer> falla al cargar. Todo se hace por la API nativa.
+    private static IntPtr s_campoInstancia, s_metodoLocalize;
+    private static readonly HashSet<string> s_diag = new();
+    private static void Diagnostico(string m) { if (s_diag.Add(m)) Melon<RegaloDoradoMod>.Logger.Msg("[idioma] " + m); }
+
+    private static unsafe string LeerLocale()
+    {
+        if (s_campoInstancia == IntPtr.Zero || s_metodoLocalize == IntPtr.Zero)
+        {
+            IntPtr localizer = IL2CPP.GetIl2CppClass("Tekly.Localizations.Runtime.dll", "Tekly.Localizations", "Localizer");
+            if (localizer == IntPtr.Zero) { Diagnostico("sin clase Localizer"); return ""; }
+
+            IntPtr interfaz = IntPtr.Zero, iter = IntPtr.Zero, i;
+            while ((i = IL2CPP.il2cpp_class_get_interfaces(localizer, ref iter)) != IntPtr.Zero)
+                if (Marshal.PtrToStringAnsi(IL2CPP.il2cpp_class_get_name(i)) == "ILocalizer") { interfaz = i; break; }
+            if (interfaz == IntPtr.Zero) { Diagnostico("sin ILocalizer"); return ""; }
+
+            IntPtr singleton = IL2CPP.GetIl2CppClass("Tekly.Common.Runtime.dll", "Tekly.Common.Utils", "Singleton`2");
+            var tipo = Il2CppSystem.Type.internal_from_handle(IL2CPP.il2cpp_class_get_type(singleton))
+                .MakeGenericType(new Il2CppReferenceArray<Il2CppSystem.Type>(new[]
+                {
+                    Il2CppSystem.Type.internal_from_handle(IL2CPP.il2cpp_class_get_type(localizer)),
+                    Il2CppSystem.Type.internal_from_handle(IL2CPP.il2cpp_class_get_type(interfaz)),
+                }));
+            IntPtr clase = IL2CPP.il2cpp_class_from_type(tipo.TypeHandle.value);
+            IL2CPP.il2cpp_runtime_class_init(clase);
+            s_campoInstancia = IL2CPP.GetIl2CppField(clase, "<Instance>k__BackingField");
+            s_metodoLocalize = IL2CPP.il2cpp_class_get_method_from_name(localizer, "Localize", 1);
+            if (s_campoInstancia == IntPtr.Zero || s_metodoLocalize == IntPtr.Zero)
+            { Diagnostico("sin campo Instance o método Localize"); return ""; }
+        }
+
+        IntPtr instancia = IntPtr.Zero;
+        IL2CPP.il2cpp_field_static_get_value(s_campoInstancia, &instancia);
+        if (instancia == IntPtr.Zero) { Diagnostico("Instance nulo"); return ""; }
+
+        void** args = stackalloc void*[1];
+        args[0] = (void*)IL2CPP.ManagedStringToIl2Cpp("$LOCALE");
+        IntPtr excepcion = IntPtr.Zero;
+        IntPtr resultado = IL2CPP.il2cpp_runtime_invoke(s_metodoLocalize, instancia, args, ref excepcion);
+        if (excepcion != IntPtr.Zero) { Diagnostico("Localize lanzó una excepción"); return ""; }
+        return IL2CPP.Il2CppStringToManaged(resultado) ?? "";
+    }
+}
+
+// --- Errores del mod ---
+
+// Un fallo del mod no debe romper la tienda: se registra una vez y se descarta.
+// Los errores que no vienen del mod se dejan pasar sin tocar.
+internal static class Seguro
+{
+    private static readonly HashSet<string> s_vistos = new();
+
+    internal static Exception Atrapar(Exception e)
+    {
+        if (e == null || !(e.StackTrace ?? "").Contains("RegaloDorado.")) return e;
+        if (s_vistos.Add(e.GetType().Name + e.Message))
+            Melon<RegaloDoradoMod>.Logger.Error($"Error interno (la tienda sigue funcionando): {e}");
+        return null;
     }
 }
 
@@ -342,6 +407,8 @@ internal static class Miniatura
 [HarmonyPatch(typeof(StorePageModel), nameof(StorePageModel.UpdateEntries))]
 internal static class Parche_UpdateEntries
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static void Prefix(StorePageModel __instance) =>
         RegaloDoradoMod.AsegurarEntrada(__instance.m_dataService);
 }
@@ -349,6 +416,8 @@ internal static class Parche_UpdateEntries
 [HarmonyPatch(typeof(StoreEntryModel), nameof(StoreEntryModel.IsItemSoldOut))]
 internal static class Parche_IsItemSoldOut
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static bool Prefix(StoreEntryModel __instance, ref bool __result)
     {
         if (!RegaloDoradoMod.EsNuestra(__instance.m_entryData)) return true;
@@ -361,6 +430,8 @@ internal static class Parche_IsItemSoldOut
 [HarmonyPatch(typeof(StoreEntryModel), nameof(StoreEntryModel.IsComingSoon))]
 internal static class Parche_IsComingSoon
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static bool Prefix(StoreEntryModel __instance, ref bool __result)
     {
         if (!RegaloDoradoMod.EsNuestra(__instance.m_entryData)) return true;
@@ -372,6 +443,8 @@ internal static class Parche_IsComingSoon
 [HarmonyPatch(typeof(StoreEntryModel), nameof(StoreEntryModel.IsItemUnavailable))]
 internal static class Parche_IsItemUnavailable
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static bool Prefix(StoreEntryModel __instance, ref bool __result)
     {
         if (!RegaloDoradoMod.EsNuestra(__instance.m_entryData)) return true;
@@ -383,6 +456,8 @@ internal static class Parche_IsItemUnavailable
 [HarmonyPatch(typeof(StoreEntryModel), nameof(StoreEntryModel.UpdateModelData))]
 internal static class Parche_UpdateModelData
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static void Postfix(StoreEntryModel __instance)
     {
         var esNuestra = RegaloDoradoMod.EsNuestra(__instance.m_entryData);
@@ -408,12 +483,16 @@ internal static class Parche_UpdateModelData
 [HarmonyPatch(typeof(AddressableSpriteValueModel), nameof(AddressableSpriteValueModel.OnSpriteLoaded))]
 internal static class Parche_OnSpriteLoaded
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static void Postfix(AddressableSpriteValueModel __instance) => Miniatura.DorarSiEsNuestra(__instance);
 }
 
 [HarmonyPatch(typeof(StoreEntryModel), nameof(StoreEntryModel.SetBubbleText))]
 internal static class Parche_SetBubbleText
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static void Postfix(StoreEntryModel __instance)
     {
         if (!RegaloDoradoMod.EsNuestra(__instance.m_entryData)) return;
@@ -427,6 +506,8 @@ internal static class Parche_SetBubbleText
 [HarmonyPatch(typeof(StoreModel), nameof(StoreModel.PurchaseSelectedItem))]
 internal static class Parche_PurchaseSelectedItem
 {
+    private static Exception Finalizer(Exception __exception) => Seguro.Atrapar(__exception);
+
     private static bool Prefix(StoreModel __instance)
     {
         if (!RegaloDoradoMod.EsNuestra(__instance.m_purchaseData)) return true;
